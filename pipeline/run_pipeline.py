@@ -141,21 +141,21 @@ def merge_ablation_and_export_model(cfg, model_path, direction, pos, layer):
     # Load the original model
     model = AutoModelForCausalLM.from_pretrained(model_path)
     device = next(model.parameters()).device  # Get the device of the model
+    direction = direction.to(device)
 
     # Apply the ablation direction to the model
     with torch.no_grad():
-        # Assuming the position is an index into the attention matrices
         attention = model.model.layers[layer].self_attn
         if hasattr(attention, 'q_proj'):
-            # For models with separate Q, K, V projections
             matrices = [attention.q_proj, attention.k_proj, attention.v_proj]
         elif hasattr(attention, 'W_pack'):
-            # For models with packed QKV projection
             matrices = [attention.W_pack]
         else:
             raise ValueError("Unsupported model architecture")
 
         if abs(pos) <= len(matrices):
+            print(f"Matrix device: {matrices[pos].weight.device}")
+            print(f"Direction device: {direction.device}")
             matrices[pos].weight -= direction
         else:
             raise ValueError(f"Invalid position: {pos}")
