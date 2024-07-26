@@ -221,7 +221,7 @@ def run_pipeline(model_path):
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
     actadd_fwd_pre_hooks, actadd_fwd_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=-1.0))], []
 
-    merge_ablation_and_export_model(cfg, model_path, direction, pos, layer)
+    # merge_ablation_and_export_model(cfg, model_path, direction, pos, layer)
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
