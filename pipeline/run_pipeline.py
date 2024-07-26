@@ -4,6 +4,10 @@ import json
 import os
 import argparse
 
+from transformers import AutoModelForCausalLM
+from safetensors.torch import save_file
+from huggingface_hub import HfApi
+
 from dataset.load_dataset import load_dataset_split, load_dataset
 
 from pipeline.config import Config
@@ -56,7 +60,7 @@ def filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, har
         harmless_val_scores = get_refusal_scores(model_base.model, harmless_val, model_base.tokenize_instructions_fn, model_base.refusal_toks)
         harmful_val = filter_examples(harmful_val, harmful_val_scores, 0, lambda x, y: x > y)
         harmless_val = filter_examples(harmless_val, harmless_val_scores, 0, lambda x, y: x < y)
-    
+
     return harmful_train, harmless_train, harmful_val, harmless_val
 
 def generate_and_save_candidate_directions(cfg, model_base, harmful_train, harmless_train):
@@ -103,7 +107,7 @@ def generate_and_save_completions_for_dataset(cfg, model_base, fwd_pre_hooks, fw
         dataset = load_dataset(dataset_name)
 
     completions = model_base.generate_completions(dataset, fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks, max_new_tokens=cfg.max_new_tokens)
-    
+
     with open(f'{cfg.artifact_path()}/completions/{dataset_name}_{intervention_label}_completions.json', "w") as f:
         json.dump(completions, f, indent=4)
 
@@ -133,6 +137,67 @@ def evaluate_loss_for_datasets(cfg, model_base, fwd_pre_hooks, fwd_hooks, interv
     with open(f'{cfg.artifact_path()}/loss_evals/{intervention_label}_loss_eval.json', "w") as f:
         json.dump(loss_evals, f, indent=4)
 
+def merge_ablation_and_export_model(cfg, model_path, direction, pos, layer):
+    # Load the original model
+    model = AutoModelForCausalLM.from_pretrained(model_path)
+    device = next(model.parameters()).device  # Get the device of the model
+
+    # Apply the ablation direction to the model
+    with torch.no_grad():
+        # Assuming the position is an index into the attention matrices
+        attention = model.model.layers[layer].self_attn
+        if hasattr(attention, 'q_proj'):
+            # For models with separate Q, K, V projections
+            matrices = [attention.q_proj, attention.k_proj, attention.v_proj]
+        elif hasattr(attention, 'W_pack'):
+            # For models with packed QKV projection
+            matrices = [attention.W_pack]
+        else:
+            raise ValueError("Unsupported model architecture")
+
+        if abs(pos) <= len(matrices):
+            matrices[pos].weight -= direction
+        else:
+            raise ValueError(f"Invalid position: {pos}")
+
+    # Convert model to state dict
+    state_dict = model.state_dict()
+
+    # Save the model in safetensors format locally
+    output_path = f'{cfg.artifact_path()}/merged_model.safetensors'
+    save_file(state_dict, output_path)
+
+    print(f"Merged model saved locally to {output_path}")
+
+    # Push to Hugging Face Hub
+    original_model_name = model_path.split('/')[-1]
+    new_model_name = f"{original_model_name}-ablated"
+    repo_id = f"NaniDAO/{new_model_name}"
+
+    api = HfApi()
+    api.create_repo(repo_id, exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=output_path,
+        path_in_repo="model.safetensors",
+        repo_id=repo_id,
+    )
+
+    # Save config and tokenizer files
+    model.config.save_pretrained(cfg.artifact_path())
+    if hasattr(model, 'tokenizer'):
+        model.tokenizer.save_pretrained(cfg.artifact_path())
+    else:
+        print("Warning: Model doesn't have a tokenizer attribute. Tokenizer not saved.")
+
+    # Upload config and tokenizer files
+    api.upload_folder(
+        folder_path=cfg.artifact_path(),
+        path_in_repo="",
+        repo_id=repo_id,
+    )
+
+    print(f"Model pushed to Hugging Face Hub: {repo_id}")
+
 def run_pipeline(model_path):
     """Run the full pipeline."""
     model_alias = os.path.basename(model_path)
@@ -142,19 +207,21 @@ def run_pipeline(model_path):
 
     # Load and sample datasets
     harmful_train, harmless_train, harmful_val, harmless_val = load_and_sample_datasets(cfg)
-    
+
     # Filter datasets based on refusal scores
     harmful_train, harmless_train, harmful_val, harmless_val = filter_data(cfg, model_base, harmful_train, harmless_train, harmful_val, harmless_val)
 
     # 1. Generate candidate refusal directions
     candidate_directions = generate_and_save_candidate_directions(cfg, model_base, harmful_train, harmless_train)
-    
+
     # 2. Select the most effective refusal direction
     pos, layer, direction = select_and_save_direction(cfg, model_base, harmful_val, harmless_val, candidate_directions)
 
     baseline_fwd_pre_hooks, baseline_fwd_hooks = [], []
     ablation_fwd_pre_hooks, ablation_fwd_hooks = get_all_direction_ablation_hooks(model_base, direction)
     actadd_fwd_pre_hooks, actadd_fwd_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=-1.0))], []
+
+    merge_ablation_and_export_model(cfg, model_path, direction, pos, layer)
 
     # 3a. Generate and save completions on harmful evaluation datasets
     for dataset_name in cfg.evaluation_datasets:
@@ -167,12 +234,12 @@ def run_pipeline(model_path):
         evaluate_completions_and_save_results_for_dataset(cfg, 'baseline', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
         evaluate_completions_and_save_results_for_dataset(cfg, 'ablation', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
         evaluate_completions_and_save_results_for_dataset(cfg, 'actadd', dataset_name, eval_methodologies=cfg.jailbreak_eval_methodologies)
-    
+
     # 4a. Generate and save completions on harmless evaluation dataset
     harmless_test = random.sample(load_dataset_split(harmtype='harmless', split='test'), cfg.n_test)
 
     generate_and_save_completions_for_dataset(cfg, model_base, baseline_fwd_pre_hooks, baseline_fwd_hooks, 'baseline', 'harmless', dataset=harmless_test)
-    
+
     actadd_refusal_pre_hooks, actadd_refusal_hooks = [(model_base.model_block_modules[layer], get_activation_addition_input_pre_hook(vector=direction, coeff=+1.0))], []
     generate_and_save_completions_for_dataset(cfg, model_base, actadd_refusal_pre_hooks, actadd_refusal_hooks, 'actadd', 'harmless', dataset=harmless_test)
 
